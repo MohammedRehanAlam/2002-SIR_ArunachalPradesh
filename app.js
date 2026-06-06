@@ -13,7 +13,7 @@ if (typeof pdfjsLib !== 'undefined')
 
 // ── Cache Manager
 const CacheManager = {
-  CACHE_NAME: 'fetcher-index-cache-v1',
+  CACHE_NAME: 'fetcher-index-cache-v2',
   async get(url) {
     try {
       const cache = await caches.open(this.CACHE_NAME);
@@ -1174,316 +1174,460 @@ function buildCard({ fileInfo, matches }, terms, index) {
     let contentHtml = "";
     if (m.type === 'table' && m.data) {
       const allRows = m.data;
-      // Separate top text (titles) from table data
-      let tableStart = allRows.findIndex(r => {
-        const rowText = r.join(" ").toUpperCase();
-        // Skip page headers like Constituency and PS NO so they stay in topRows metadata
-        if (rowText.includes("CONSTITUENCY") || rowText.includes("PS NO:")) return false;
-        return r.filter(c => c.trim()).length >= 3;
-      });
-      if (tableStart === -1) tableStart = 0;
       
-      const topRows = allRows.slice(0, tableStart);
-      const mainRows = allRows.slice(tableStart);
-      
-      const isHeader = mainRows[0]?.some(h => /name|id|no|age|gender|epic|date|total|amt|desc|type|status|addr|phone|email|sl|const|constituency|house|slno|sl.no/i.test(h))
-                    || (mainRows.length > 1 && mainRows[0].every(c => isNaN(c.replace(/[$,]/g, ''))) && mainRows[1].some(c => !isNaN(c.replace(/[$,]/g, '')) && c.trim() !== ""));
-      const headRow = isHeader ? mainRows[0] : null;
-      const dataRows = isHeader ? mainRows.slice(1) : mainRows;
-      
-      const matchingRows = dataRows.filter(row => row.some(cell => matchTerms(String(cell), terms, 'OR', false, false)));
-      const displayRows = matchingRows.length > 0 ? matchingRows : dataRows.slice(0, 5);
-
-      // Prune empty columns and merge leading "title" columns
-      // Prune empty columns based ONLY on row data
-      const activeCols = [];
-      const colCount = mainRows[0]?.length || 0;
-      for (let c = 0; c < colCount; c++) {
-        const nonCount = displayRows.filter(r => {
-          const val = (r[c] || "").trim();
-          const clean = val.replace(/[-–—/.,()]/g, "").trim();
-          return clean.length > 0;
-        }).length;
+      // Check if it's an elector table (electoral roll)
+      const isElectoralRoll = allRows.some(row => row.length === 8 && /^\d+(\s+|$)/.test(row[0].trim()));
+                              
+      if (isElectoralRoll) {
+        // Dedicated parsing for Electoral Rolls
+        const electorRows = allRows.filter(row => row.length === 8 && /^\d+(\s+|$)/.test(row[0].trim()));
         
-        // A column is active if it has data in at least 25% of display rows (prevents single-row garbage cells from creating empty columns)
-        const minRows = Math.max(1, Math.ceil(displayRows.length * 0.25));
-        if (nonCount >= minRows) {
-          activeCols.push(c);
+        // Explicitly search for AC No & Name / Part No rows
+        let acText = "";
+        
+        allRows.forEach(row => {
+          const rowText = row.filter(c => c.trim()).join(" ").replace(/\s+/g, " ").trim();
+          if (/ac\s*no/i.test(rowText) || /part\s*no/i.test(rowText)) {
+            acText = rowText;
+          }
+        });
+        
+        let topHtml = "";
+        if (acText) {
+          let formattedAc = escapeHtml(acText);
+          if (formattedAc.toLowerCase().includes("part no")) {
+            formattedAc = formattedAc.replace(/(\bPart\s+No\s*:)/i, "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;$1");
+          }
+          topHtml += `<div class="match-table-meta">${formattedAc}</div>`;
         }
-      }
-      
-      let finalHead = null;
-      if (headRow) {
-        finalHead = new Array(activeCols.length).fill("");
         
-        // 1. Build all candidate pairs between headers and active columns with semantic safety filters
-        const candidates = [];
-        headRow.forEach((headerText, origColIdx) => {
-          const txt = (headerText || "").trim();
-          if (!txt) return;
-          
-          activeCols.forEach((activeColIdx) => {
-            const dist = Math.abs(activeColIdx - origColIdx);
-            if (dist <= 6) {
-              // Semantic Safety Filters to prevent mismatched categories
-              const values = displayRows.map(r => (r[activeColIdx] || "").trim()).filter(v => v);
-              const isAllNumeric = values.length > 0 && values.every(v => !isNaN(v.replace(/[$,]/g, '')));
-              const isAllShort = values.length > 0 && values.every(v => v.length <= 4);
-
-              // Rule A: EPIC No cannot map to a purely numeric column (which is clearly an Age column)
-              if (/epic|no/i.test(txt) && isAllNumeric) return;
-
-              // Rule B: Name headers cannot map to short relation types (like "భ", "తవ")
-              if (/name|relation/i.test(txt) && !/rln/i.test(txt) && isAllShort) return;
-
-              // Rule C: Rln Type header cannot map to a long text column (Name)
-              if (/rln\s*type|type/i.test(txt) && !isAllShort) return;
-
-              // Rule D: Metadata headers (PS No, Sl. No, Section No, House No) cannot map to high-index columns (activeColIdx >= 4)
-              if (/ps\b|sl\b|serial|section|house/i.test(txt) && activeColIdx >= 4) return;
-
-              candidates.push({ txt, origColIdx, activeColIdx, dist });
+        // Fallback in case explicit extraction returned nothing
+        if (!topHtml) {
+          const metadataRows = allRows.filter(row => !electorRows.includes(row));
+          const topHtmlRows = metadataRows.filter(row => {
+            const rowText = row.join(" ").toLowerCase();
+            if (rowText.includes("elector") || rowText.includes("relationship") || rowText.includes("epic no") || rowText.includes("serial no") || rowText.includes("section no")) {
+              return false;
             }
+            return row.some(cell => cell.trim().length > 0);
+          });
+          
+          topHtml = topHtmlRows.map(r => {
+            const rawText = r.filter(c => c.trim()).join(" ").replace(/\s+/g, " ").trim();
+            if (rawText.toLowerCase().includes("state code") || rawText.toLowerCase().includes("section no")) return "";
+            let text = escapeHtml(rawText);
+            if (text.toLowerCase().includes("part no")) {
+              text = text.replace(/(\bPart\s+No\s*:)/i, "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;$1");
+            }
+            return `<div class="match-table-meta">${text}</div>`;
+          }).filter(html => html !== "").join("");
+        }
+        
+        const matchingRows = electorRows.filter(row => row.some(cell => matchTerms(String(cell), terms, 'OR', false, false)));
+        const displayRows = matchingRows.length > 0 ? matchingRows : electorRows.slice(0, 5);
+        
+        const finalHead = ["Sl. No.", "House No.", "Name of Elector", "Relationship", "Name of Relation", "Sex", "Age", "EPIC No."];
+        
+        // Deduplicate overlapping values & reconstruct 8 columns
+        let finalRows = displayRows.map(row => {
+          let cells = new Array(8).fill("");
+          const col0 = (row[0] || "").trim();
+          const parts = col0.split(/\s+/);
+          
+          if (parts.length >= 2 && /^\d+$/.test(parts[0])) {
+            cells[0] = parts[0];
+            cells[1] = parts.slice(1).join(" ");
+            cells[2] = (row[1] || "").trim();
+            cells[3] = (row[3] || "").trim();
+            cells[4] = (row[4] || "").trim();
+            cells[5] = (row[5] || "").trim();
+            cells[6] = (row[6] || "").trim();
+            cells[7] = (row[7] || "").trim();
+          } else {
+            cells[0] = col0;
+            cells[1] = (row[1] || "").trim();
+            cells[2] = (row[2] || "").trim();
+            cells[3] = (row[3] || "").trim();
+            cells[4] = (row[4] || "").trim();
+            cells[5] = (row[5] || "").trim();
+            cells[6] = (row[6] || "").trim();
+            cells[7] = (row[7] || "").trim();
+          }
+          
+          return cells.map((cell, cellIdx) => {
+            let val = cell.trim();
+            
+            const cleanVal = val.replace(/\s+/g, "");
+            if (cleanVal.length > 1) {
+              const chars = Array.from(cleanVal);
+              const uniqueChars = new Set(chars);
+              if (uniqueChars.size === 1) {
+                if (/^[ప\u0C2A]+$/.test(cleanVal)) {
+                  val = "ప";
+                } else if (/^[స\u0C38]+$/.test(cleanVal)) {
+                  val = "సస";
+                } else {
+                  val = chars[0];
+                }
+              } else {
+                const len = cleanVal.length;
+                for (let partLen = 1; partLen <= Math.floor(len / 2); partLen++) {
+                  if (len % partLen === 0) {
+                    const part = cleanVal.substring(0, partLen);
+                    let isRepeated = true;
+                    for (let offset = partLen; offset < len; offset += partLen) {
+                      if (cleanVal.substring(offset, offset + partLen) !== part) {
+                        isRepeated = false;
+                        break;
+                      }
+                    }
+                    if (isRepeated) {
+                      const headerName = finalHead[cellIdx];
+                      if (part.length > 2 || /Sex|Gender|Age|EPIC|Sl/i.test(headerName) || /^[0-9]+$/.test(part)) {
+                        const origClean = val.replace(/\s+/g, " ");
+                        const halfLen = Math.floor(origClean.length / 2);
+                        if (origClean.length % 2 === 0 && origClean.substring(0, halfLen).trim() === origClean.substring(halfLen).trim()) {
+                          val = origClean.substring(0, halfLen).trim();
+                        } else {
+                          val = part;
+                        }
+                        break;
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            
+            if (finalHead[cellIdx] === "Sex" || finalHead[cellIdx] === "Gender") {
+              const genderClean = val.replace(/\s+/g, "");
+              if (/^[ప\u0C2A]+$/.test(genderClean)) {
+                val = "ప";
+              } else if (/^[స\u0C38]+$/.test(genderClean)) {
+                val = "సస";
+              }
+            }
+            return val;
           });
         });
         
-        // 2. Sort candidate pairs by distance (ascending) so the best matches are assigned first.
-        // If distances are equal, sort by original column index to maintain left-to-right stability.
-        candidates.sort((a, b) => {
-          if (a.dist !== b.dist) return a.dist - b.dist;
-          return a.origColIdx - b.origColIdx;
+        contentHtml = `${topHtml}<div class="match-table-wrapper"><table class="match-table">
+          <thead><tr>${finalHead.map(h => `<th>${escapeHtml(h)}</th>`).join('')}</tr></thead>
+          <tbody>${finalRows.map(row => `<tr>${row.map(cell => `<td>${highlightAll(String(cell || ''), terms)}</td>`).join('')}</tr>`).join('')}</tbody>
+        </table>${matchingRows.length > displayRows.length ? `<div class="match-table-more">+ ${matchingRows.length - displayRows.length} more matching rows</div>` : ''}</div>`;
+        
+      } else {
+        // Fallback dynamic heuristic parsing for non-electoral tables
+        let tableStart = allRows.findIndex(r => {
+          const rowText = r.join(" ").toUpperCase();
+          // Skip page headers like Constituency and PS NO so they stay in topRows metadata
+          if (rowText.includes("CONSTITUENCY") || rowText.includes("PS NO:")) return false;
+          return r.filter(c => c.trim()).length >= 3;
         });
+        if (tableStart === -1) tableStart = 0;
         
-        // 3. Greedy 1-to-1 matching to uniquely assign each header to at most one active column
-        const matchedHeaders = new Set();
-        const matchedActiveCols = new Set();
-        const colToHeader = new Map(); // activeColIdx -> txt
+        const topRows = allRows.slice(0, tableStart);
+        const mainRows = allRows.slice(tableStart);
         
-        candidates.forEach(cand => {
-          const headerKey = `${cand.txt}_${cand.origColIdx}`;
-          if (!matchedHeaders.has(headerKey) && !matchedActiveCols.has(cand.activeColIdx)) {
-            matchedHeaders.add(headerKey);
-            matchedActiveCols.add(cand.activeColIdx);
-            colToHeader.set(cand.activeColIdx, cand.txt);
-          }
-        });
+        const isHeader = mainRows[0]?.some(h => /name|id|no|age|gender|epic|date|total|amt|desc|type|status|addr|phone|email|sl|const|constituency|house|slno|sl.no/i.test(h))
+                      || (mainRows.length > 1 && mainRows[0].every(c => isNaN(c.replace(/[$,]/g, ''))) && mainRows[1].some(c => !isNaN(c.replace(/[$,]/g, '')) && c.trim() !== ""));
+        const headRow = isHeader ? mainRows[0] : null;
+        const dataRows = isHeader ? mainRows.slice(1) : mainRows;
         
-        // 4. Fill finalHead with the unique mapped headers
-        activeCols.forEach((activeColIdx, finalIdx) => {
-          if (colToHeader.has(activeColIdx)) {
-            finalHead[finalIdx] = colToHeader.get(activeColIdx);
-          } else {
-            // Fallback to exact column index if not uniquely matched
-            finalHead[finalIdx] = (headRow[activeColIdx] || "").trim();
-          }
-        });
-        
-        // 5. Prepend any unmapped headers that occur before the first active column (prefix logic)
-        let prefix = "";
-        headRow.forEach((headerText, origColIdx) => {
-          const txt = (headerText || "").trim();
-          if (!txt) return;
+        const matchingRows = dataRows.filter(row => row.some(cell => matchTerms(String(cell), terms, 'OR', false, false)));
+        const displayRows = matchingRows.length > 0 ? matchingRows : dataRows.slice(0, 5);
+
+        // Prune empty columns and merge leading "title" columns
+        // Prune empty columns based ONLY on row data
+        const activeCols = [];
+        const colCount = mainRows[0]?.length || 0;
+        for (let c = 0; c < colCount; c++) {
+          const nonCount = displayRows.filter(r => {
+            const val = (r[c] || "").trim();
+            const clean = val.replace(/[-–—/.,()]/g, "").trim();
+            return clean.length > 0;
+          }).length;
           
-          const headerKey = `${txt}_${origColIdx}`;
-          if (!matchedHeaders.has(headerKey) && origColIdx < activeCols[0]) {
-            prefix += (prefix ? " " : "") + txt;
+          // A column is active if it has data in at least 25% of display rows (prevents single-row garbage cells from creating empty columns)
+          const minRows = Math.max(1, Math.ceil(displayRows.length * 0.25));
+          if (nonCount >= minRows) {
+            activeCols.push(c);
           }
-        });
+        }
         
-        if (prefix) {
-          finalHead[0] = prefix + " " + (finalHead[0] || "");
-        }
-
-        // 6. Propagation pass to fill in any empty active column headers from adjacent key columns
-        // Run left-to-right to propagate left neighbor headers
-        for (let i = 1; i < finalHead.length; i++) {
-          if (finalHead[i] === "" && finalHead[i - 1]) {
-            if (/elector|name|relation|gender|age|type/i.test(finalHead[i - 1])) {
-              finalHead[i] = finalHead[i - 1];
-            }
-          }
-        }
-        // Run right-to-left to propagate right neighbor headers
-        for (let i = finalHead.length - 2; i >= 0; i--) {
-          if (finalHead[i] === "" && finalHead[i + 1]) {
-            if (/elector|name|relation|gender|age|type/i.test(finalHead[i + 1])) {
-              finalHead[i] = finalHead[i + 1];
-            }
-          }
-        }
-
-        // 7. Splitting pass for split headers like "Gender   Age"
-        activeCols.forEach((activeColIdx, finalIdx) => {
-          const header = finalHead[finalIdx] || "";
-          if (header.toUpperCase().includes("GENDER") && header.toUpperCase().includes("AGE")) {
-            const values = displayRows.map(r => (r[activeColIdx] || "").trim()).filter(v => v);
-            const isAllNumeric = values.length > 0 && values.every(v => !isNaN(v.replace(/[$,]/g, '')));
-            if (isAllNumeric) {
-              finalHead[finalIdx] = "Age";
-            } else {
-              finalHead[finalIdx] = "Gender";
-            }
-          }
-        });
-
-        // 7.5. Set custom comprehensive header dynamically for the first metadata column (works for any state/PDF structure)
-        if (finalHead && finalHead[0] && finalHead.some(h => h && /elector|name|relation|gender|age|type/i.test(h))) {
-          const metaParts = [];
+        let finalHead = null;
+        if (headRow) {
+          finalHead = new Array(activeCols.length).fill("");
+          
+          // 1. Build all candidate pairs between headers and active columns with semantic safety filters
+          const candidates = [];
           headRow.forEach((headerText, origColIdx) => {
             const txt = (headerText || "").trim();
             if (!txt) return;
-            if (origColIdx < 8 && /ps\b|sl\b|serial|section|house|part\b|no\b/i.test(txt)) {
-              if (!metaParts.includes(txt)) {
-                metaParts.push(txt);
+            
+            activeCols.forEach((activeColIdx) => {
+              const dist = Math.abs(activeColIdx - origColIdx);
+              if (dist <= 6) {
+                // Semantic Safety Filters to prevent mismatched categories
+                const values = displayRows.map(r => (r[activeColIdx] || "").trim()).filter(v => v);
+                const isAllNumeric = values.length > 0 && values.every(v => !isNaN(v.replace(/[$,]/g, '')));
+                const isAllShort = values.length > 0 && values.every(v => v.length <= 4);
+
+                // Rule A: EPIC No cannot map to a purely numeric column (which is clearly an Age column)
+                if (/epic|no/i.test(txt) && isAllNumeric) return;
+
+                // Rule B: Name headers cannot map to short relation types (like "భ", "తవ")
+                if (/name|relation/i.test(txt) && !/rln/i.test(txt) && isAllShort) return;
+
+                // Rule C: Rln Type header cannot map to a long text column (Name)
+                if (/rln\s*type|type/i.test(txt) && !isAllShort) return;
+
+                // Rule D: Metadata headers (PS No, Sl. No, Section No, House No) cannot map to high-index columns (activeColIdx >= 4)
+                if (/ps\b|sl\b|serial|section|house/i.test(txt) && activeColIdx >= 4) return;
+
+                candidates.push({ txt, origColIdx, activeColIdx, dist });
               }
+            });
+          });
+          
+          // 2. Sort candidate pairs by distance (ascending) so the best matches are assigned first.
+          // If distances are equal, sort by original column index to maintain left-to-right stability.
+          candidates.sort((a, b) => {
+            if (a.dist !== b.dist) return a.dist - b.dist;
+            return a.origColIdx - b.origColIdx;
+          });
+          
+          // 3. Greedy 1-to-1 matching to uniquely assign each header to at most one active column
+          const matchedHeaders = new Set();
+          const matchedActiveCols = new Set();
+          const colToHeader = new Map(); // activeColIdx -> txt
+          
+          candidates.forEach(cand => {
+            const headerKey = `${cand.txt}_${cand.origColIdx}`;
+            if (!matchedHeaders.has(headerKey) && !matchedActiveCols.has(cand.activeColIdx)) {
+              matchedHeaders.add(headerKey);
+              matchedActiveCols.add(cand.activeColIdx);
+              colToHeader.set(cand.activeColIdx, cand.txt);
             }
           });
-          if (metaParts.length > 0) {
-            const formattedParts = metaParts.map(p => p.trim().replace(/ {2,}/g, (match) => "\u00a0".repeat(match.length)));
-            let dynamicHeader = formattedParts[0];
-            if (formattedParts.length > 1) {
-              dynamicHeader += "\u00a0\u00a0\u00a0" + formattedParts[1]; // Adds 3 spaces and then "Sl. No" -> "PS No   Sl. No"
-            }
-            if (formattedParts.length > 2) {
-              dynamicHeader += "\u00a0\u00a0\u00a0" + formattedParts[2]; // Adds 3 spaces and then "Section No" -> "PS No   Sl. No   Section No"
-            }
-            if (formattedParts.length > 3) {
-              dynamicHeader += "\u00a0\u00a0\u00a0" + formattedParts[3]; // Adds 3 spaces and then "House No" -> "PS No   Sl. No   Section No   House No"
-            }
-            for (let idx = 4; idx < formattedParts.length; idx++) {
-              dynamicHeader += "\u00a0\u00a0\u00a0" + formattedParts[idx];
-            }
-            finalHead[0] = dynamicHeader;
-          }
-        }
-      }
-
-      if (finalHead && finalHead.length === 8) {
-        const isElectorTable = finalHead.some(h => /elector|relation|epic|sex|gender|slno|sl\.no/i.test(h)) || 
-                               displayRows.some(row => row.some(cell => /AN\/\d+|^[A-Z]{3}\d+/i.test(cell)));
-        if (isElectorTable) {
-          finalHead = ["Sl. No.", "House No.", "Name of Elector", "Relationship", "Name of Relation", "Sex", "Age", "EPIC No."];
-        }
-      }
-
-      let finalRows = displayRows.map(r => activeCols.map((i, finalIdx) => {
-        let val = (r[i] || "").trim();
-        
-        // 1. General Cell Anomaly Self-Correction for ANY column in the table:
-        // Automatically detects and resolves PDF overlapping text duplicates (e.g., "284 284", "AP32219 AP32219", "రమ రమ")
-        const cleanVal = val.replace(/\s+/g, "");
-        if (cleanVal.length > 1) {
-          // Check for repeated single characters (e.g., "MM" -> "M", "ஆஆ" -> "ஆ")
-          const chars = Array.from(cleanVal);
-          const uniqueChars = new Set(chars);
-          if (uniqueChars.size === 1) {
-            // For Telugu Pa/Sa, we respect the user's specific mappings
-            if (/^[ప\u0C2A]+$/.test(cleanVal)) {
-              val = "ప";
-            } else if (/^[స\u0C38]+$/.test(cleanVal)) {
-              val = "సస";
+          
+          // 4. Fill finalHead with the unique mapped headers
+          activeCols.forEach((activeColIdx, finalIdx) => {
+            if (colToHeader.has(activeColIdx)) {
+              finalHead[finalIdx] = colToHeader.get(activeColIdx);
             } else {
-              val = chars[0];
+              // Fallback to exact column index if not uniquely matched
+              finalHead[finalIdx] = (headRow[activeColIdx] || "").trim();
             }
-          } else {
-            // Check for repeated multi-char substring patterns (e.g. "284284" -> "284", "पुपु" -> "पु", "स्त్రీస్త్రీ" -> "స్త్రీ")
-            const len = cleanVal.length;
-            for (let partLen = 1; partLen <= Math.floor(len / 2); partLen++) {
-              if (len % partLen === 0) {
-                const part = cleanVal.substring(0, partLen);
-                let isRepeated = true;
-                for (let offset = partLen; offset < len; offset += partLen) {
-                  if (cleanVal.substring(offset, offset + partLen) !== part) {
-                    isRepeated = false;
-                    break;
-                  }
-                }
-                if (isRepeated) {
-                  // Protect short non-anomalous double-syllable names like "mama", "chacha" unless they are part of Gender column
-                  if (part.length > 2 || (finalHead && finalHead[finalIdx] === "Gender") || /^[0-9]+$/.test(part)) {
-                    // Reconstruct the value preserving spaces if possible, or just keep the deduplicated part
-                    val = (r[i] || "").trim();
-                    const origClean = val.replace(/\s+/g, " ");
-                    const halfLen = Math.floor(origClean.length / 2);
-                    if (origClean.length % 2 === 0 && origClean.substring(0, halfLen).trim() === origClean.substring(halfLen).trim()) {
-                      val = origClean.substring(0, halfLen).trim();
-                    } else {
-                      val = part;
-                    }
-                    break;
-                  }
-                }
-              }
-            }
-          }
-        }
-        
-        // 2. Specific Telugu Gender refinement if it's the Gender column
-        if (finalHead && finalHead[finalIdx] === "Gender") {
-          const genderClean = val.replace(/\s+/g, "");
-          if (/^[ప\u0C2A]+$/.test(genderClean)) {
-            val = "ప";
-          } else if (/^[స\u0C38]+$/.test(genderClean)) {
-            val = "సస";
-          }
-        }
-
-        // 3. Add extra spacing for the first column (PS No / Serial No / House No metadata)
-        if (finalIdx === 0) {
-          let count = 0;
-          val = val.replace(/ +/g, (match) => {
-            count++;
-            if (count <= 1) return " \u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0 ";
-            if (count <= 2) return " \u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0 ";
-            if (count <= 3) return " \u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0 ";
-            return match;
           });
-        }
-        
-        return val;
-      }));
+          
+          // 5. Prepend any unmapped headers that occur before the first active column (prefix logic)
+          let prefix = "";
+          headRow.forEach((headerText, origColIdx) => {
+            const txt = (headerText || "").trim();
+            if (!txt) return;
+            
+            const headerKey = `${txt}_${origColIdx}`;
+            if (!matchedHeaders.has(headerKey) && origColIdx < activeCols[0]) {
+              prefix += (prefix ? " " : "") + txt;
+            }
+          });
+          
+          if (prefix) {
+            finalHead[0] = prefix + " " + (finalHead[0] || "");
+          }
 
-      // 8. COLUMN MERGING PASS: Merge adjacent columns with duplicate headers on-the-fly
-      if (finalHead) {
-        const keepIndices = [];
-        const mergedHead = [];
-        
-        for (let i = 0; i < finalHead.length; i++) {
-          const currentHeader = finalHead[i];
-          if (currentHeader === null) continue;
-          
-          mergedHead.push(currentHeader);
-          
-          if (currentHeader && /elector|name|relation|gender|age|type/i.test(currentHeader)) {
-            for (let j = i + 1; j < finalHead.length; j++) {
-              if (finalHead[j] === currentHeader) {
-                finalRows.forEach(row => {
-                  const valI = (row[i] || "").trim();
-                  const valJ = (row[j] || "").trim();
-                  row[i] = valI + (valI && valJ ? " " : "") + valJ;
-                });
-                finalHead[j] = null; // Mark as merged
+          // 6. Propagation pass to fill in any empty active column headers from adjacent key columns
+          // Run left-to-right to propagate left neighbor headers
+          for (let i = 1; i < finalHead.length; i++) {
+            if (finalHead[i] === "" && finalHead[i - 1]) {
+              if (/elector|name|relation|gender|age|type/i.test(finalHead[i - 1])) {
+                finalHead[i] = finalHead[i - 1];
               }
             }
           }
-          keepIndices.push(i);
-        }
-        
-        finalHead = mergedHead;
-        finalRows = finalRows.map(row => keepIndices.map(idx => row[idx]));
-      }
+          // Run right-to-left to propagate right neighbor headers
+          for (let i = finalHead.length - 2; i >= 0; i--) {
+            if (finalHead[i] === "" && finalHead[i + 1]) {
+              if (/elector|name|relation|gender|age|type/i.test(finalHead[i + 1])) {
+                finalHead[i] = finalHead[i + 1];
+              }
+            }
+          }
 
-      const topHtml = topRows.map(r => {
-        let text = escapeHtml(r.join(" ").replace(/\s+/g, " ").trim());
-        // Only inject the large gap specifically before "PS NO:"
-        const formatted = text.replace(/(\bPS\s+NO:)/i, "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;$1");
-        return `<div class="match-table-meta">${formatted}</div>`;
-      }).join("");
-      
-      contentHtml = `${topHtml}<div class="match-table-wrapper"><table class="match-table">
-        ${finalHead ? `<thead><tr>${finalHead.map(h => `<th>${escapeHtml(h)}</th>`).join('')}</tr></thead>` : ''}
-        <tbody>${finalRows.map(row => `<tr>${row.map(cell => `<td>${highlightAll(String(cell || ''), terms)}</td>`).join('')}</tr>`).join('')}</tbody>
-      </table>${matchingRows.length > displayRows.length ? `<div class="match-table-more">+ ${matchingRows.length - displayRows.length} more matching rows</div>` : ''}</div>`;
+          // 7. Splitting pass for split headers like "Gender   Age"
+          activeCols.forEach((activeColIdx, finalIdx) => {
+            const header = finalHead[finalIdx] || "";
+            if (header.toUpperCase().includes("GENDER") && header.toUpperCase().includes("AGE")) {
+              const values = displayRows.map(r => (r[activeColIdx] || "").trim()).filter(v => v);
+              const isAllNumeric = values.length > 0 && values.every(v => !isNaN(v.replace(/[$,]/g, '')));
+              if (isAllNumeric) {
+                finalHead[finalIdx] = "Age";
+              } else {
+                finalHead[finalIdx] = "Gender";
+              }
+            }
+          });
+
+          // 7.5. Set custom comprehensive header dynamically for the first metadata column (works for any state/PDF structure)
+          if (finalHead && finalHead[0] && finalHead.some(h => h && /elector|name|relation|gender|age|type/i.test(h))) {
+            const metaParts = [];
+            headRow.forEach((headerText, origColIdx) => {
+              const txt = (headerText || "").trim();
+              if (!txt) return;
+              if (origColIdx < 8 && /ps\b|sl\b|serial|section|house|part\b|no\b/i.test(txt)) {
+                if (!metaParts.includes(txt)) {
+                  metaParts.push(txt);
+                }
+              }
+            });
+            if (metaParts.length > 0) {
+              const formattedParts = metaParts.map(p => p.trim().replace(/ {2,}/g, (match) => "\u00a0".repeat(match.length)));
+              let dynamicHeader = formattedParts[0];
+              if (formattedParts.length > 1) {
+                dynamicHeader += "\u00a0\u00a0\u00a0" + formattedParts[1]; // Adds 3 spaces and then "Sl. No" -> "PS No   Sl. No"
+              }
+              if (formattedParts.length > 2) {
+                dynamicHeader += "\u00a0\u00a0\u00a0" + formattedParts[2]; // Adds 3 spaces and then "Section No" -> "PS No   Sl. No   Section No"
+              }
+              if (formattedParts.length > 3) {
+                dynamicHeader += "\u00a0\u00a0\u00a0" + formattedParts[3]; // Adds 3 spaces and then "House No" -> "PS No   Sl. No   Section No   House No"
+              }
+              for (let idx = 4; idx < formattedParts.length; idx++) {
+                dynamicHeader += "\u00a0\u00a0\u00a0" + formattedParts[idx];
+              }
+              finalHead[0] = dynamicHeader;
+            }
+          }
+        }
+
+        if (finalHead && finalHead.length === 8) {
+          const isElectorTable = finalHead.some(h => /elector|relation|epic|sex|gender|slno|sl\.no/i.test(h)) || 
+                                  displayRows.some(row => row.some(cell => /AN\/\d+|^[A-Z]{3}\d+/i.test(cell)));
+          if (isElectorTable) {
+            finalHead = ["Sl. No.", "House No.", "Name of Elector", "Relationship", "Name of Relation", "Sex", "Age", "EPIC No."];
+          }
+        }
+
+        let finalRows = displayRows.map(r => activeCols.map((i, finalIdx) => {
+          let val = (r[i] || "").trim();
+          
+          // 1. General Cell Anomaly Self-Correction for ANY column in the table:
+          // Automatically detects and resolves PDF overlapping text duplicates (e.g., "284 284", "AP32219 AP32219", "రమ రమ")
+          const cleanVal = val.replace(/\s+/g, "");
+          if (cleanVal.length > 1) {
+            // Check for repeated single characters (e.g., "MM" -> "M", "ఆఆ" -> "ఆ")
+            const chars = Array.from(cleanVal);
+            const uniqueChars = new Set(chars);
+            if (uniqueChars.size === 1) {
+              // For Telugu Pa/Sa, we respect the user's specific mappings
+              if (/^[ప\u0C2A]+$/.test(cleanVal)) {
+                val = "ప";
+              } else if (/^[స\u0C38]+$/.test(cleanVal)) {
+                val = "సస";
+              } else {
+                val = chars[0];
+              }
+            } else {
+              // Check for repeated multi-char substring patterns (e.g. "284284" -> "284", "पुपु" -> "पु", "స్త్రీస్త్రీ" -> "స్త్రీ")
+              const len = cleanVal.length;
+              for (let partLen = 1; partLen <= Math.floor(len / 2); partLen++) {
+                if (len % partLen === 0) {
+                  const part = cleanVal.substring(0, partLen);
+                  let isRepeated = true;
+                  for (let offset = partLen; offset < len; offset += partLen) {
+                    if (cleanVal.substring(offset, offset + partLen) !== part) {
+                      isRepeated = false;
+                      break;
+                    }
+                  }
+                  if (isRepeated) {
+                    // Protect short non-anomalous double-syllable names like "mama", "chacha" unless they are part of Gender column
+                    if (part.length > 2 || (finalHead && finalHead[finalIdx] === "Gender") || /^[0-9]+$/.test(part)) {
+                      // Reconstruct the value preserving spaces if possible, or just keep the deduplicated part
+                      val = (r[i] || "").trim();
+                      const origClean = val.replace(/\s+/g, " ");
+                      const halfLen = Math.floor(origClean.length / 2);
+                      if (origClean.length % 2 === 0 && origClean.substring(0, halfLen).trim() === origClean.substring(halfLen).trim()) {
+                        val = origClean.substring(0, halfLen).trim();
+                      } else {
+                        val = part;
+                      }
+                      break;
+                    }
+                  }
+                }
+              }
+            }
+          }
+          
+          // 2. Specific Telugu Gender refinement if it's the Gender column
+          if (finalHead && finalHead[finalIdx] === "Gender") {
+            const genderClean = val.replace(/\s+/g, "");
+            if (/^[ప\u0C2A]+$/.test(genderClean)) {
+              val = "ప";
+            } else if (/^[స\u0C38]+$/.test(genderClean)) {
+              val = "సస";
+            }
+          }
+
+          // 3. Add extra spacing for the first column (PS No / Serial No / House No metadata)
+          if (finalIdx === 0) {
+            let count = 0;
+            val = val.replace(/ +/g, (match) => {
+              count++;
+              if (count <= 1) return " \u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0 ";
+              if (count <= 2) return " \u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0 ";
+              if (count <= 3) return " \u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0 ";
+              return match;
+            });
+          }
+          
+          return val;
+        }));
+
+        // 8. COLUMN MERGING PASS: Merge adjacent columns with duplicate headers on-the-fly
+        if (finalHead) {
+          const keepIndices = [];
+          const mergedHead = [];
+          
+          for (let i = 0; i < finalHead.length; i++) {
+            const currentHeader = finalHead[i];
+            if (currentHeader === null) continue;
+            
+            mergedHead.push(currentHeader);
+            
+            if (currentHeader && /elector|name|relation|gender|age|type/i.test(currentHeader)) {
+              for (let j = i + 1; j < finalHead.length; j++) {
+                if (finalHead[j] === currentHeader) {
+                  finalRows.forEach(row => {
+                    const valI = (row[i] || "").trim();
+                    const valJ = (row[j] || "").trim();
+                    row[i] = valI + (valI && valJ ? " " : "") + valJ;
+                  });
+                  finalHead[j] = null; // Mark as merged
+                }
+              }
+            }
+            keepIndices.push(i);
+          }
+          
+          finalHead = mergedHead;
+          finalRows = finalRows.map(row => keepIndices.map(idx => row[idx]));
+        }
+
+        const topHtml = topRows.map(r => {
+          let text = escapeHtml(r.join(" ").replace(/\s+/g, " ").trim());
+          // Only inject the large gap specifically before "PS NO:"
+          const formatted = text.replace(/(\bPS\s+NO:)/i, "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;$1");
+          return `<div class="match-table-meta">${formatted}</div>`;
+        }).join("");
+        
+        contentHtml = `${topHtml}<div class="match-table-wrapper"><table class="match-table">
+          ${finalHead ? `<thead><tr>${finalHead.map(h => `<th>${escapeHtml(h)}</th>`).join('')}</tr></thead>` : ''}
+          <tbody>${finalRows.map(row => `<tr>${row.map(cell => `<td>${highlightAll(String(cell || ''), terms)}</td>`).join('')}</tr>`).join('')}</tbody>
+        </table>${matchingRows.length > displayRows.length ? `<div class="match-table-more">+ ${matchingRows.length - displayRows.length} more matching rows</div>` : ''}</div>`;
+      }
     } else {
       const snippets = m.occurrences.map(occ => extractSnippet(m.text, occ.term, false, SNIPPET_RADIUS, occ.index));
       contentHtml = snippets.map(s => `<div class="match-snippet">${highlightAll(s, terms)}</div>`).join('');
