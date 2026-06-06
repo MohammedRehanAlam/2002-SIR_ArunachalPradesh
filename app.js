@@ -1176,51 +1176,31 @@ function buildCard({ fileInfo, matches }, terms, index) {
       const allRows = m.data;
       
       // Check if it's an elector table (electoral roll)
-      const isElectoralRoll = allRows.some(row => row.length === 8 && /^\d+(\s+|$)/.test(row[0].trim()));
+      const isElectoralRoll = allRows.some(row => row.length === 8 && /^(?:[a-zA-Z]\s*)?\d+(\s+|$)/.test(row[0].trim()));
                               
       if (isElectoralRoll) {
-        // Dedicated parsing for Electoral Rolls
-        const electorRows = allRows.filter(row => row.length === 8 && /^\d+(\s+|$)/.test(row[0].trim()));
+        // Dedicated parsing for Electoral Rolls (supports prefixes like S, D, C for deleted/modified entries)
+        const electorRows = allRows.filter(row => row.length === 8 && /^(?:[a-zA-Z]\s*)?\d+(\s+|$)/.test(row[0].trim()));
         
         // Explicitly search for AC No & Name / Part No rows
-        let acText = "";
-        
+        const acTexts = [];
         allRows.forEach(row => {
           const rowText = row.filter(c => c.trim()).join(" ").replace(/\s+/g, " ").trim();
-          if (/ac\s*no/i.test(rowText) || /part\s*no/i.test(rowText)) {
-            acText = rowText;
+          if (!electorRows.includes(row) && (/ac\s*no/i.test(rowText) || /part\s*no/i.test(rowText))) {
+            acTexts.push(rowText);
           }
         });
         
         let topHtml = "";
-        if (acText) {
-          let formattedAc = escapeHtml(acText);
-          if (formattedAc.toLowerCase().includes("part no")) {
-            formattedAc = formattedAc.replace(/(\bPart\s+No\s*:)/i, "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;$1");
-          }
-          topHtml += `<div class="match-table-meta">${formattedAc}</div>`;
-        }
-        
-        // Fallback in case explicit extraction returned nothing
-        if (!topHtml) {
-          const metadataRows = allRows.filter(row => !electorRows.includes(row));
-          const topHtmlRows = metadataRows.filter(row => {
-            const rowText = row.join(" ").toLowerCase();
-            if (rowText.includes("elector") || rowText.includes("relationship") || rowText.includes("epic no") || rowText.includes("serial no") || rowText.includes("section no")) {
-              return false;
+        if (acTexts.length > 0) {
+          const uniqueAcTexts = Array.from(new Set(acTexts));
+          topHtml = uniqueAcTexts.map(text => {
+            let formattedAc = escapeHtml(text);
+            if (formattedAc.toLowerCase().includes("part no")) {
+              formattedAc = formattedAc.replace(/(\bPart\s+No\s*:)/i, "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;$1");
             }
-            return row.some(cell => cell.trim().length > 0);
-          });
-          
-          topHtml = topHtmlRows.map(r => {
-            const rawText = r.filter(c => c.trim()).join(" ").replace(/\s+/g, " ").trim();
-            if (rawText.toLowerCase().includes("state code") || rawText.toLowerCase().includes("section no")) return "";
-            let text = escapeHtml(rawText);
-            if (text.toLowerCase().includes("part no")) {
-              text = text.replace(/(\bPart\s+No\s*:)/i, "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;$1");
-            }
-            return `<div class="match-table-meta">${text}</div>`;
-          }).filter(html => html !== "").join("");
+            return `<div class="match-table-meta">${formattedAc}</div>`;
+          }).join("");
         }
         
         const matchingRows = electorRows.filter(row => row.some(cell => matchTerms(String(cell), terms, 'OR', false, false)));
@@ -1234,9 +1214,27 @@ function buildCard({ fileInfo, matches }, terms, index) {
           const col0 = (row[0] || "").trim();
           const parts = col0.split(/\s+/);
           
-          if (parts.length >= 2 && /^\d+$/.test(parts[0])) {
-            cells[0] = parts[0];
-            cells[1] = parts.slice(1).join(" ");
+          let isMerged = false;
+          let serialNo = "";
+          let houseNo = "";
+          
+          if (parts.length >= 3 && /^[a-zA-Z]$/.test(parts[0]) && /^\d+$/.test(parts[1])) {
+            isMerged = true;
+            serialNo = parts[0] + " " + parts[1];
+            houseNo = parts.slice(2).join(" ");
+          } else if (parts.length >= 2 && /^[a-zA-Z]\d+$/.test(parts[0])) {
+            isMerged = true;
+            serialNo = parts[0];
+            houseNo = parts.slice(1).join(" ");
+          } else if (parts.length >= 2 && /^\d+$/.test(parts[0])) {
+            isMerged = true;
+            serialNo = parts[0];
+            houseNo = parts.slice(1).join(" ");
+          }
+          
+          if (isMerged) {
+            cells[0] = serialNo;
+            cells[1] = houseNo;
             cells[2] = (row[1] || "").trim();
             cells[3] = (row[3] || "").trim();
             cells[4] = (row[4] || "").trim();
